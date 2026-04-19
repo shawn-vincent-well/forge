@@ -1,0 +1,664 @@
+#!/bin/bash
+#
+# forge — spin up Claude Code agents in isolated git worktrees
+#
+# Usage:
+#   forge new [type] <name> [--detach] [-- <command>]
+#   forge ls
+#   forge attach <name>
+#   forge teardown <name> [--force]
+#
+# Types: feature (default), bug, experiment
+#
+# Examples:
+#   forge new "patient-context"
+#   forge new bug "stale-websocket"
+#   forge new experiment "try-zustand"
+#   forge new "review-pr-42" -- /review-pr 42
+#   forge ls
+#   forge attach patient-context
+#   forge teardown feature/patient-context
+#   forge teardown --force experiment/try-zustand
+#
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ─── Helpers ──────────────────────────────────────────────
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g'
+}
+
+detect_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
+detect_project_name() {
+  basename "$(detect_repo_root)"
+}
+
+detect_base_branch() {
+  local repo_root="$1"
+  # Check for develop first, then main, then master
+  for branch in develop main master; do
+    if git -C "$repo_root" rev-parse --verify "$branch" >/dev/null 2>&1; then
+      echo "$branch"
+      return
+    fi
+  done
+  echo "main"
+}
+
+worktrees_dir_for_repo() {
+  local repo_root="$1"
+  local parent
+  parent="$(dirname "$repo_root")"
+  local project
+  project="$(basename "$repo_root")"
+  echo "${parent}/${project}-worktrees"
+}
+
+# Find all forge-managed worktrees across all known repos
+find_all_worktrees() {
+  # Look for worktree dirs matching the *-worktrees pattern in ~/projects
+  local projects_dir="$HOME/projects"
+  if [[ ! -d "$projects_dir" ]]; then
+    return
+  fi
+
+  for wt_dir in "$projects_dir"/*-worktrees; do
+    [[ -d "$wt_dir" ]] || continue
+    local project_name="${wt_dir##*/}"
+    project_name="${project_name%-worktrees}"
+
+    for worktree in "$wt_dir"/*/; do
+      [[ -d "$worktree/.git" || -f "$worktree/.git" ]] || continue
+      echo "${project_name}|${worktree%/}"
+    done
+  done
+
+  # Also check autoscribe/worktrees (legacy location)
+  if [[ -d "$projects_dir/autoscribe/worktrees" ]]; then
+    for worktree in "$projects_dir/autoscribe/worktrees"/*/; do
+      [[ -d "$worktree/.git" || -f "$worktree/.git" ]] || continue
+      echo "autoscribe_ui_new|${worktree%/}"
+    done
+  fi
+}
+
+relative_time() {
+  local timestamp="$1"
+  local now
+  now=$(date +%s)
+  local diff=$(( now - timestamp ))
+
+  if (( diff < 60 )); then
+    echo "just now"
+  elif (( diff < 3600 )); then
+    echo "$(( diff / 60 ))m ago"
+  elif (( diff < 86400 )); then
+    echo "$(( diff / 3600 ))h ago"
+  else
+    echo "$(( diff / 86400 ))d ago"
+  fi
+}
+
+# Find a worktree by partial name match
+find_worktree_by_name() {
+  local search="$1"
+  local matches=()
+
+  while IFS='|' read -r project path; do
+    local branch
+    branch=$(git -C "$path" branch --show-current 2>/dev/null || echo "")
+    if [[ "$branch" == "$search" ]]; then
+      # Exact match — return immediately
+      echo "$project|$path|$branch"
+      return 0
+    fi
+    if [[ "$branch" == *"$search"* ]]; then
+      matches+=("$project|$path|$branch")
+    fi
+  done < <(find_all_worktrees)
+
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    return 1
+  elif [[ ${#matches[@]} -eq 1 ]]; then
+    echo "${matches[0]}"
+    return 0
+  else
+    echo -e "${RED}Multiple matches for '${search}':${NC}" >&2
+    for m in "${matches[@]}"; do
+      IFS='|' read -r proj p br <<< "$m"
+      echo "  $proj > $br" >&2
+    done
+    echo "Be more specific." >&2
+    return 1
+  fi
+}
+
+# ─── Commands ─────────────────────────────────────────────
+
+cmd_new() {
+  local detach=false
+  local command=""
+  local worktree_type=""
+  local worktree_name=""
+
+  # Parse args
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --detach)
+        detach=true
+        shift
+        ;;
+      --)
+        shift
+        command="$*"
+        break
+        ;;
+      -*)
+        echo -e "${RED}Error: Unknown flag $1${NC}"
+        exit 1
+        ;;
+      *)
+        positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # Parse positional args
+  case ${#positional[@]} in
+    0)
+      echo -e "${RED}Error: Name is required${NC}"
+      echo "Usage: forge new [type] <name> [--detach] [-- <command>]"
+      echo "Types: feature (default), bug, experiment"
+      exit 1
+      ;;
+    1)
+      worktree_type="feature"
+      worktree_name="${positional[0]}"
+      ;;
+    2)
+      worktree_type="${positional[0]}"
+      worktree_name="${positional[1]}"
+      ;;
+    *)
+      echo -e "${RED}Error: Too many arguments${NC}"
+      echo "Usage: forge new [type] <name> [--detach] [-- <command>]"
+      exit 1
+      ;;
+  esac
+
+  # Validate type
+  case "$worktree_type" in
+    feature|bug|experiment) ;;
+    # Legacy aliases
+    forge)
+      worktree_type="feature"
+      ;;
+    squash)
+      echo -e "${YELLOW}Note: 'squash' is deprecated, use 'bug' instead${NC}"
+      worktree_type="bug"
+      ;;
+    *)
+      echo -e "${RED}Error: Invalid type '${worktree_type}'${NC}"
+      echo "Valid types: feature, bug, experiment"
+      exit 1
+      ;;
+  esac
+
+  # Detect repo
+  local repo_root
+  repo_root=$(detect_repo_root)
+  if [[ -z "$repo_root" ]]; then
+    echo -e "${RED}Error: Not in a git repository${NC}"
+    exit 1
+  fi
+
+  local project_name
+  project_name=$(detect_project_name)
+  local base_branch
+  base_branch=$(detect_base_branch "$repo_root")
+  local worktrees_dir
+  worktrees_dir=$(worktrees_dir_for_repo "$repo_root")
+
+  # Slugify
+  local slug
+  slug=$(slugify "$worktree_name")
+  local branch_name="${worktree_type}/${slug}"
+  local worktree_path="${worktrees_dir}/${slug}"
+
+  echo -e "🔥 ${GREEN}Forging ${branch_name}...${NC}"
+  echo "  Project: ${project_name}"
+  echo "  Branch:  ${branch_name}"
+  echo "  Base:    ${base_branch}"
+  echo "  Path:    ${worktree_path}"
+  echo ""
+
+  # Pre-flight checks
+  if [[ -d "$worktree_path" ]]; then
+    echo -e "${RED}Error: Directory already exists: ${worktree_path}${NC}"
+    exit 1
+  fi
+
+  if git -C "$repo_root" rev-parse --verify "$branch_name" >/dev/null 2>&1; then
+    echo -e "${RED}Error: Branch already exists: ${branch_name}${NC}"
+    echo "To use the existing branch:"
+    echo "  git worktree add \"${worktree_path}\" ${branch_name}"
+    exit 1
+  fi
+
+  # Fetch latest base branch
+  echo -e "${YELLOW}Fetching latest ${base_branch}...${NC}"
+  git -C "$repo_root" fetch origin "${base_branch}:${base_branch}" 2>/dev/null || true
+
+  # Create worktrees dir
+  mkdir -p "$worktrees_dir"
+
+  # Create the worktree
+  echo -e "${YELLOW}Creating git worktree from ${base_branch}...${NC}"
+  git -C "$repo_root" worktree add -b "$branch_name" "$worktree_path" "$base_branch"
+
+  # npm install (if package.json exists)
+  if [[ -f "${worktree_path}/package.json" ]]; then
+    echo -e "${YELLOW}Running npm install...${NC}"
+    (cd "$worktree_path" && npm install)
+  fi
+
+  # Copy .env if it exists
+  if [[ -f "${repo_root}/.env" ]]; then
+    cp "${repo_root}/.env" "${worktree_path}/.env"
+    echo "  Copied .env"
+  fi
+
+  # Copy .mcp.json if it exists
+  if [[ -f "${repo_root}/.mcp.json" ]]; then
+    cp "${repo_root}/.mcp.json" "${worktree_path}/.mcp.json"
+    echo "  Copied .mcp.json"
+  fi
+
+  # Generate CLAUDE.local.md
+  local created_date
+  created_date=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+  cat > "${worktree_path}/CLAUDE.local.md" <<EOF
+# Git Worktree Context
+
+**You are working in a git worktree!**
+
+## This Worktree
+
+- **Purpose**: ${worktree_name}
+- **Type**: ${worktree_type}
+- **Branch**: \`${branch_name}\`
+- **Project**: ${project_name}
+- **Created**: ${created_date}
+
+## Custom Greeting
+
+When you start a conversation in this worktree, greet the user with:
+
+1. A friendly acknowledgment that you're in the "${worktree_name}" worktree
+2. Mention the branch: \`${branch_name}\`
+3. Brief explanation of worktree workflow (see below)
+4. Ask how you can help with this specific work
+
+## Working in a Worktree
+
+### Key Concepts
+
+- **Isolated environment**: This worktree is a separate checkout of the repo with its own branch
+- **Independent state**: Changes here don't affect other worktrees (including main)
+- **Shared git history**: All worktrees share the same git repository and history
+- **Separate node_modules**: Each worktree has its own dependencies (already installed)
+
+### Standard Workflow
+
+1. **Work normally**: Make changes, commit as usual
+2. **Keep commits focused**: Since this is a ${worktree_type} branch, keep commits related to the purpose
+3. **Test thoroughly** before finalizing
+4. **Create a PR**: Push the branch and create a PR against \`${base_branch}\`
+
+### Useful Commands
+
+\`\`\`bash
+# List all forge sessions
+forge ls
+
+# See what branch you're on
+git branch --show-current
+
+# View changes since branching
+git diff ${base_branch}...HEAD
+
+# Push branch to remote
+git push -u origin ${branch_name}
+
+# Return to this worktree's tmux session
+forge attach ${slug}
+\`\`\`
+
+### To Remove When Done
+
+\`\`\`bash
+forge teardown ${branch_name}
+\`\`\`
+
+### What NOT to Do
+
+- Don't try to check out \`${branch_name}\` in another worktree (git prevents this)
+- Don't modify the main worktree while working here (causes confusion)
+- Don't leave worktrees lying around after you're done (clean up!)
+EOF
+
+  echo "  Created CLAUDE.local.md"
+
+  # If inside tmux, auto-detach
+  if [[ -n "$TMUX" && "$detach" == false ]]; then
+    echo -e "${YELLOW}Note: Inside tmux, creating detached session${NC}"
+    detach=true
+  fi
+
+  # Check tmux is available
+  if ! command -v tmux &> /dev/null; then
+    echo -e "${YELLOW}Warning: tmux not found, skipping session creation${NC}"
+    echo "  Install with: brew install tmux"
+    echo ""
+    echo -e "🔥 ${GREEN}Worktree ready (no tmux)${NC}"
+    echo "  cd ${worktree_path}"
+    return
+  fi
+
+  # Check if session already exists
+  if tmux has-session -t "$branch_name" 2>/dev/null; then
+    echo -e "${YELLOW}Session '${branch_name}' already exists${NC}"
+    if [[ "$detach" == false ]]; then
+      tmux attach-session -t "$branch_name"
+    fi
+    return
+  fi
+
+  # Create tmux session
+  tmux new-session -d -s "$branch_name" -n "claude" -c "$worktree_path"
+
+  # Start Claude
+  if [[ -n "$command" ]]; then
+    tmux send-keys -t "$branch_name:0" "claude --dangerously-skip-permissions '${command}'" C-m
+  else
+    tmux send-keys -t "$branch_name:0" "claude --dangerously-skip-permissions" C-m
+  fi
+
+  # Shell window
+  tmux new-window -t "$branch_name:1" -n "shell" -c "$worktree_path"
+  tmux select-window -t "$branch_name:0"
+
+  echo ""
+  if [[ "$detach" == true ]]; then
+    echo -e "🔥 ${GREEN}Forged ${branch_name} (detached)${NC}"
+    echo "  To attach: forge attach ${slug}"
+    echo "  Or: tmux switch-client -t '${branch_name}'"
+  else
+    echo -e "🔥 ${GREEN}Forged ${branch_name}${NC}"
+    tmux attach-session -t "$branch_name"
+  fi
+}
+
+cmd_ls() {
+  local found=false
+
+  while IFS='|' read -r project path; do
+    found=true
+
+    # Branch name
+    local branch
+    branch=$(git -C "$path" branch --show-current 2>/dev/null || echo "unknown")
+
+    # Tmux status
+    local session_status
+    if tmux has-session -t "$branch" 2>/dev/null; then
+      session_status="🔥 alive"
+    else
+      session_status="💀 dead"
+    fi
+
+    # File status (count modified/untracked/staged)
+    local modified_count
+    modified_count=$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    local file_status
+    if [[ "$modified_count" -eq 0 ]]; then
+      file_status="clean"
+    else
+      file_status="${modified_count} modified"
+    fi
+
+    # Push status
+    local push_status
+    local unpushed
+    unpushed=$(git -C "$path" log --oneline "@{upstream}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ $? -ne 0 ]] || ! git -C "$path" rev-parse --verify "@{upstream}" >/dev/null 2>&1; then
+      # No upstream set
+      local commit_count
+      commit_count=$(git -C "$path" log --oneline "${branch%%/*}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+      if [[ "$commit_count" -gt 0 ]]; then
+        push_status="unpushed"
+      else
+        push_status="no commits"
+      fi
+    elif [[ "$unpushed" -gt 0 ]]; then
+      push_status="unpushed"
+    else
+      push_status="pushed"
+    fi
+
+    # Last commit time
+    local last_commit_ts
+    last_commit_ts=$(git -C "$path" log -1 --format=%ct 2>/dev/null || echo "")
+    local last_commit
+    if [[ -n "$last_commit_ts" ]]; then
+      last_commit="last commit $(relative_time "$last_commit_ts")"
+    else
+      last_commit="no commits"
+    fi
+
+    echo "${project} > ${branch} - ${session_status} - ${file_status} (${push_status}) - ${last_commit}"
+  done < <(find_all_worktrees)
+
+  if [[ "$found" == false ]]; then
+    echo "No forge sessions found."
+  fi
+}
+
+cmd_attach() {
+  local search="$1"
+
+  if [[ -z "$search" ]]; then
+    echo -e "${RED}Error: Name is required${NC}"
+    echo "Usage: forge attach <name>"
+    echo "Run 'forge ls' to see active sessions."
+    exit 1
+  fi
+
+  local match
+  match=$(find_worktree_by_name "$search") || exit 1
+
+  IFS='|' read -r project path branch <<< "$match"
+
+  # Check tmux session exists
+  if ! tmux has-session -t "$branch" 2>/dev/null; then
+    echo -e "${RED}Error: No tmux session for ${branch}${NC}"
+    echo "The worktree exists but the tmux session is dead."
+    echo ""
+    echo "To recreate the session:"
+    echo "  cd ${path} && claude"
+    exit 1
+  fi
+
+  echo -e "🔥 ${GREEN}Attaching to ${branch}...${NC}"
+
+  if [[ -n "$TMUX" ]]; then
+    tmux switch-client -t "$branch"
+  else
+    tmux attach-session -t "$branch"
+  fi
+}
+
+cmd_teardown() {
+  local force=false
+  local search=""
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)
+        force=true
+        shift
+        ;;
+      -*)
+        echo -e "${RED}Error: Unknown flag $1${NC}"
+        exit 1
+        ;;
+      *)
+        search="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$search" ]]; then
+    echo -e "${RED}Error: Name is required${NC}"
+    echo "Usage: forge teardown <name> [--force]"
+    echo "Run 'forge ls' to see active sessions."
+    exit 1
+  fi
+
+  local match
+  match=$(find_worktree_by_name "$search") || exit 1
+
+  IFS='|' read -r project path branch <<< "$match"
+
+  # Check for dirty state (unless --force)
+  if [[ "$force" == false ]]; then
+    local issues=()
+
+    # Unstaged changes
+    local unstaged
+    unstaged=$(git -C "$path" diff --name-only 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$unstaged" -gt 0 ]]; then
+      issues+=("${unstaged} unstaged changes")
+    fi
+
+    # Uncommitted (staged) changes
+    local staged
+    staged=$(git -C "$path" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$staged" -gt 0 ]]; then
+      issues+=("${staged} uncommitted staged changes")
+    fi
+
+    # Untracked files
+    local untracked
+    untracked=$(git -C "$path" ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$untracked" -gt 0 ]]; then
+      issues+=("${untracked} untracked files")
+    fi
+
+    # Unpushed commits
+    local unpushed=0
+    if git -C "$path" rev-parse --verify "@{upstream}" >/dev/null 2>&1; then
+      unpushed=$(git -C "$path" log --oneline "@{upstream}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+    else
+      # No upstream — check if there are any commits beyond base branch
+      local base_branch
+      base_branch=$(detect_base_branch "$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/.git$||' || echo "$path")")
+      unpushed=$(git -C "$path" log --oneline "${base_branch}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    if [[ "$unpushed" -gt 0 ]]; then
+      issues+=("${unpushed} unpushed commits")
+    fi
+
+    if [[ ${#issues[@]} -gt 0 ]]; then
+      local joined
+      joined=$(IFS=' and '; echo "${issues[*]}")
+      echo -e "⛔ ${RED}${branch} has ${joined}!${NC}"
+      echo "Use --force to remove anyway."
+      exit 1
+    fi
+  fi
+
+  echo -e "💀 ${YELLOW}Tearing down ${branch}...${NC}"
+
+  # Kill tmux session
+  if tmux has-session -t "$branch" 2>/dev/null; then
+    tmux kill-session -t "$branch"
+    echo "  → killed tmux session"
+  fi
+
+  # Find the repo root from the worktree's git common dir
+  local repo_root
+  repo_root=$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/.git$||' || echo "")
+
+  # Remove worktree
+  git -C "$path" worktree remove --force "$path" 2>/dev/null \
+    || git worktree remove --force "$path" 2>/dev/null \
+    || { echo -e "${RED}  → failed to remove worktree${NC}"; }
+  echo "  → removed worktree"
+
+  # Delete branch
+  if [[ -n "$repo_root" ]]; then
+    git -C "$repo_root" branch -D "$branch" 2>/dev/null && echo "  → deleted branch" \
+      || echo -e "${YELLOW}  → branch already removed${NC}"
+    git -C "$repo_root" worktree prune 2>/dev/null
+  fi
+
+  echo -e "✨ ${GREEN}Gone!${NC}"
+}
+
+# ─── Main ─────────────────────────────────────────────────
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  new)
+    cmd_new "$@"
+    ;;
+  ls)
+    cmd_ls "$@"
+    ;;
+  attach)
+    cmd_attach "$@"
+    ;;
+  teardown)
+    cmd_teardown "$@"
+    ;;
+  ""|help|-h|--help)
+    echo "forge — spin up Claude Code agents in isolated git worktrees"
+    echo ""
+    echo "Usage:"
+    echo "  forge new [type] <name> [--detach] [-- <command>]"
+    echo "  forge ls"
+    echo "  forge attach <name>"
+    echo "  forge teardown <name> [--force]"
+    echo ""
+    echo "Types: feature (default), bug, experiment"
+    echo ""
+    echo "Examples:"
+    echo "  forge new \"patient-context\""
+    echo "  forge new bug \"stale-websocket\""
+    echo "  forge new experiment \"try-zustand\" -- /review-pr 42"
+    echo "  forge ls"
+    echo "  forge attach patient-context"
+    echo "  forge teardown feature/patient-context"
+    ;;
+  *)
+    echo -e "${RED}Error: Unknown command '${cmd}'${NC}"
+    echo "Run 'forge help' for usage."
+    exit 1
+    ;;
+esac
